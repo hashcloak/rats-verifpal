@@ -1,0 +1,110 @@
+attacker[active]
+
+principal Provisioner [
+    knows public eif
+    knows public linux_kernel_bootstrap
+    knows public app
+    knows public iam_role
+    knows public pid
+    knows public certificate
+
+    pcr0_provisioned = HASH(eif)
+    pcr1_provisioned = HASH(linux_kernel_bootstrap)
+    pcr2_provisioned = HASH(app)
+    pcr3_provisioned = HASH(iam_role)
+    pcr4_provisioned = HASH(pid)
+    pcr8_provisioned = HASH(certificate)
+]
+
+Provisioner -> KMS: pcr0_provisioned, pcr1_provisioned, pcr2_provisioned, pcr3_provisioned, pcr4_provisioned, pcr8_provisioned
+
+principal Enclave[
+  // Enclave's runtime keys
+  generates enclave_private_key
+  enclave_public_key = PUBKEY(enclave_private_key)
+  
+]
+
+principal KMS[
+  generates kms_secret_key
+  generates data_secret_key
+  encrypted_data_secret_key = ENC(kms_secret_key, data_secret_key)
+]
+
+KMS -> Client: data_secret_key, encrypted_data_secret_key
+
+principal Client[
+  knows private data
+  encrypted_data = ENC(data_secret_key, data)
+]
+
+Client -> Enclave: encrypted_data_secret_key, encrypted_data
+
+Enclave -> NitroHypervisor: enclave_public_key
+
+principal NitroHypervisor[    
+    // PCR0
+    knows public image
+    hash_image = HASH(eif)
+  
+    // PCR1
+    knows public linux_bootstrap
+    hash_linux_bootstrap = HASH(linux_kernel_bootstrap)
+
+    // PCR2
+    knows public application
+    hash_application = HASH(app)
+  
+    //PCR3
+    knows public arn
+    hash_arn = HASH(iam_role)
+ 
+    // PCR4
+    knows public parent_instance_id
+    hash_pid = HASH(pid)
+
+    //PCR8
+    //knows public certificate
+    hash_cert = HASH(certificate)
+
+    knows private k
+    nitro_pubkey = PUBKEY(k)
+    att_acc = CONCAT(hash_image, hash_linux_bootstrap, hash_application, hash_arn, hash_pid)
+    attestation = CONCAT(enclave_public_key, att_acc, hash_cert)
+    attestation_sig = SIGN(k, attestation)
+    
+]
+
+NitroHypervisor -> Enclave: attestation, attestation_sig, nitro_pubkey
+Enclave -> KMS: attestation, attestation_sig, nitro_pubkey, enclave_public_key
+
+principal KMS[
+    _ = SIGNVERIF(nitro_pubkey, attestation, attestation_sig)
+    enclave_pubkey, pcrs, pcrs8 = SPLIT(attestation)
+    pcrs0, pcrs1, pcrs2, pcrs3, pcrs4 = SPLIT(pcrs)
+    _ = ASSERT(pcrs0, pcr0_provisioned)?
+    _ = ASSERT(pcrs1, pcr1_provisioned)?
+    _ = ASSERT(pcrs2, pcr2_provisioned)?
+    _ = ASSERT(pcrs3, pcr3_provisioned)?
+    _ = ASSERT(pcrs4, pcr4_provisioned)?
+    _ = ASSERT(pcrs8, pcr8_provisioned)?
+    _ = ASSERT(enclave_pubkey, enclave_public_key)?
+    // data_secret_key = DEC(kms_secret_key, encrypted_data_secret_key)
+    enclave_encrypted_data_secret_key = PKE_ENC(enclave_pubkey, data_secret_key)
+]
+
+KMS -> Client: enclave_encrypted_data_secret_key
+Client -> Enclave: enclave_encrypted_data_secret_key
+
+principal Enclave[
+    plaintext_data_key = PKE_DEC(enclave_public_key, enclave_encrypted_data_secret_key)
+    dec_data = DEC(plaintext_data_key, encrypted_data)
+]
+
+queries[
+  confidentiality? data
+  confidentiality? dec_data
+  authentication? Enclave -> KMS: attestation_sig
+  authentication? Enclave -> KMS: attestation
+  equivalence? pcrs0, hash_image
+]
