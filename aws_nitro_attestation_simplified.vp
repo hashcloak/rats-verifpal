@@ -1,0 +1,83 @@
+// Expected: c0c0a1a1e0 at the default two sessions, c0c0a0a0e0 at --sessions 1.
+// The two a1 are duplicate acceptances: the attestation document carries nothing
+// KMS generated, so a second session's document is accepted again. Nothing is
+// forged: the attacker holds neither nitro_key nor enclave_private_key.
+//
+// Simplified from aws_nitro_attestation.vp. The five PCRs were all HASH(public),
+// symbolically interchangeable, and the nested SPLIT over an unguarded slot made
+// the search enumerate every partial assignment of eight positions at every
+// CONCAT arity pair. Two PCRs with different roles keep the protocol:
+// PCR0 (image measurement) and PCR8 (signing certificate).
+//
+// Guards stand for channels the network attacker does not sit on:
+//   [nitro_pubkey]                      the Nitro root certificate baked into KMS
+//   [enclave_public_key]                the enclave's local NSM device
+//   [enclave_encrypted_data_secret_key] KMS's TLS response, terminated in the enclave
+// The request leg Enclave -> KMS stays open: anyone can call KMS, and only the
+// signed attestation authenticates the caller.
+
+attacker[active]
+
+principal NitroHypervisor[
+    knows private nitro_key
+    nitro_pubkey = PUBKEY(nitro_key)
+]
+
+NitroHypervisor -> KMS: [nitro_pubkey]
+
+principal KMS[
+    knows public eif
+    knows public signing_cert
+    knows private data_secret_key
+    pcr0_policy = HASH(eif)
+    pcr8_policy = HASH(signing_cert)
+]
+
+principal Client[
+    knows private data
+    knows private data_secret_key
+    encrypted_data = ENC(data_secret_key, data)
+]
+
+principal Enclave[
+    generates enclave_private_key
+    enclave_public_key = PUBKEY(enclave_private_key)
+]
+
+Client -> Enclave: encrypted_data
+Enclave -> NitroHypervisor: [enclave_public_key]
+
+principal NitroHypervisor[
+    knows public eif
+    knows public signing_cert
+    pcr0 = HASH(eif)
+    pcr8 = HASH(signing_cert)
+    attestation = CONCAT(enclave_public_key, pcr0, pcr8)
+    attestation_sig = SIGN(nitro_key, attestation)
+]
+
+NitroHypervisor -> Enclave: attestation, attestation_sig
+Enclave -> KMS: attestation, attestation_sig
+
+principal KMS[
+    _ = SIGNVERIF(nitro_pubkey, attestation, attestation_sig)?
+    attested_key, attested_pcr0, attested_pcr8 = SPLIT(attestation)
+    _ = ASSERT(attested_pcr0, pcr0_policy)?
+    _ = ASSERT(attested_pcr8, pcr8_policy)?
+    enclave_encrypted_data_secret_key = PKE_ENC(attested_key, data_secret_key)
+]
+
+KMS -> Enclave: [enclave_encrypted_data_secret_key]
+
+principal Enclave[
+    plaintext_data_key = PKE_DEC(enclave_private_key, enclave_encrypted_data_secret_key)
+    dec_data = DEC(plaintext_data_key, encrypted_data)
+]
+
+queries[
+    confidentiality? data
+    confidentiality? dec_data
+    authentication? Enclave -> KMS: attestation
+    authentication? Enclave -> KMS: attestation_sig
+    equivalence? attested_pcr0, pcr0
+]
