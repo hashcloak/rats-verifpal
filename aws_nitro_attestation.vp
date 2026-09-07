@@ -111,24 +111,21 @@ principal Enclave[
     knows private tls_session_nonce
     generates request
     request_sig = MAC(iam_credentials, request)
-
-    c1 = AEAD_ENC(tls_session_key, tls_session_nonce, attestation, nil)
-    c2 = AEAD_ENC(tls_session_key, tls_session_nonce, attestation_sig, nil)
-    c3 = AEAD_ENC(tls_session_key, tls_session_nonce, request_sig, nil)
-    c4 = AEAD_ENC(tls_session_key, tls_session_nonce, encrypted_data_secret_key_d, nil)
+    attestation_m = CONCAT(attestation, attestation_sig, request_sig, encrypted_data_secret_key_d)
+    attestation_m_ct = AEAD_ENC(tls_session_key, tls_session_nonce, attestation_m, nil)
+    //c1 = AEAD_ENC(tls_session_key, tls_session_nonce, attestation, nil)
+    //c2 = AEAD_ENC(tls_session_key, tls_session_nonce, attestation_sig, nil)
+    //c3 = AEAD_ENC(tls_session_key, tls_session_nonce, request_sig, nil)
+    //c4 = AEAD_ENC(tls_session_key, tls_session_nonce, encrypted_data_secret_key_d, nil)
 
 ]
-Enclave -> KMS: c1, c2, c3, c4, request
+Enclave -> KMS: attestation_m_ct, request
 
 principal KMS[
     knows private tls_session_key
     knows private tls_session_nonce
-
-    attestation_d = AEAD_DEC(tls_session_key, tls_session_nonce, c1, nil)
-    attestation_sig_d = AEAD_DEC(tls_session_key, tls_session_nonce, c2, nil)
-    request_sig_d = AEAD_DEC(tls_session_key, tls_session_nonce, c3, nil)
-    encrypted_data_secret_key_dd = AEAD_DEC(tls_session_key, tls_session_nonce, c4, nil)
-    
+    attestation_m_d = AEAD_DEC(tls_session_key, tls_session_nonce, attestation_m_ct, nil)
+    attestation_d, attestation_sig_d, request_sig_d, encrypted_data_secret_key_dd = SPLIT(attestation_m_d)    
     actual_request_sig = MAC(iam_credentials, request)
     _ = ASSERT(actual_request_sig, request_sig_d)?
 
@@ -141,7 +138,7 @@ principal KMS[
     //_ = ASSERT(pcrs4, pcr4_provisioned)?
     _ = ASSERT(pcrs8, pcr8_provisioned)?
     //_ = ASSERT(enclave_pubkey, enclave_public_key)?
-    _ = SIGNVERIF(nitro_pubkey, attestation_d, attestation_sig_d)
+    _ = SIGNVERIF(nitro_pubkey, attestation_d, attestation_sig_d)?
 
     // Since the KMS shouldn't know the data_secret_key, it should execute the step below
     // But in verifpal, if you declare a named constant, there's no way to forget it or show that it's forgetten so the below step is not necessary
@@ -162,9 +159,7 @@ queries[
     confidentiality? data[
 	precondition[Client -> Enclave: encrypted_data]
     ]
-    authentication? Enclave -> KMS: c1
-    authentication? Enclave -> KMS: c2
-    authentication? Enclave -> KMS: c3
+    authentication? Enclave -> KMS: attestation_m_ct
     authentication? Enclave -> KMS: request
     confidentiality? kms_secret_key
     confidentiality? data_secret_key
