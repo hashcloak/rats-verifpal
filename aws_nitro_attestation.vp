@@ -16,31 +16,38 @@ principal Provisioner [
     pcr8_provisioned = HASH(certificate)
 ]
 
-Provisioner -> KMS: pcr0_provisioned, pcr1_provisioned, pcr2_provisioned, pcr3_provisioned, pcr4_provisioned, pcr8_provisioned
+Provisioner -> KMS: [pcr0_provisioned], [pcr1_provisioned], [pcr2_provisioned], [pcr3_provisioned], [pcr4_provisioned], [pcr8_provisioned]
 
-principal Enclave[
-  // Enclave's runtime keys
-  generates enclave_private_key
-  enclave_public_key = PUBKEY(enclave_private_key)
-  
-]
 
+phase[1]
+
+// The KMS is supposed to "forget" the data_secret_key when it generates it and doesn't store this key itself
 principal KMS[
-  generates kms_secret_key
-  generates data_secret_key
-  encrypted_data_secret_key = ENC(kms_secret_key, data_secret_key)
+    knows private iam_credentials
+    generates kms_secret_key
+    generates data_secret_key
+    encrypted_data_secret_key = ENC(kms_secret_key, data_secret_key)
 ]
 
-KMS -> Client: data_secret_key, encrypted_data_secret_key
+KMS -> Client: [data_secret_key], [encrypted_data_secret_key]
 
 principal Client[
   knows private data
+  knows private iam_credentials
   encrypted_data = ENC(data_secret_key, data)
 ]
 
-Client -> Enclave: encrypted_data_secret_key, encrypted_data
+phase[2]
 
-Enclave -> NitroHypervisor: enclave_public_key
+Client -> Enclave: iam_credentials, encrypted_data_secret_key, encrypted_data
+
+principal Enclave[
+    // Enclave's runtime keys
+    generates enclave_private_key
+    enclave_public_key = PUBKEY(enclave_private_key)
+]
+
+Enclave -> NitroHypervisor: [enclave_public_key]
 
 principal NitroHypervisor[    
     // PCR0
@@ -68,43 +75,76 @@ principal NitroHypervisor[
     hash_cert = HASH(certificate)
 
     knows private k
-    nitro_pubkey = PUBKEY(k)
-    att_acc = CONCAT(hash_image, hash_linux_bootstrap, hash_application, hash_arn, hash_pid)
-    attestation = CONCAT(enclave_public_key, att_acc, hash_cert)
+    nitro_public_key = PUBKEY(k)
+    //att_acc = CONCAT(hash_image, hash_linux_bootstrap, hash_application, hash_arn, hash_pid)
+    attestation = CONCAT(enclave_public_key, hash_image, hash_cert, nitro_public_key)
     attestation_sig = SIGN(k, attestation)
     
 ]
 
-NitroHypervisor -> Enclave: attestation, attestation_sig, nitro_pubkey
-Enclave -> KMS: attestation, attestation_sig, nitro_pubkey, enclave_public_key
+NitroHypervisor -> Enclave: [attestation], [attestation_sig]
+principal Enclave[
+    // TLS Session between Enclave and KMS
+    knows private tls_session_key
+    knows private tls_session_nonce
+    generates request
+    request_sig = MAC(iam_credentials, request)
+
+    c1 = AEAD_ENC(tls_session_key, tls_session_nonce, attestation, nil)
+    c2 = AEAD_ENC(tls_session_key, tls_session_nonce, attestation_sig, nil)
+    c3 = AEAD_ENC(tls_session_key, tls_session_nonce, request_sig, nil)
+
+]
+Enclave -> KMS: c1, c2, c3, request
 
 principal KMS[
-    _ = SIGNVERIF(nitro_pubkey, attestation, attestation_sig)
-    enclave_pubkey, pcrs, pcrs8 = SPLIT(attestation)
-    pcrs0, pcrs1, pcrs2, pcrs3, pcrs4 = SPLIT(pcrs)
+    knows private tls_session_key
+    knows private tls_session_nonce
+
+    attestation_d = AEAD_DEC(tls_session_key, tls_session_nonce, c1, nil)
+    attestation_sig_d = AEAD_DEC(tls_session_key, tls_session_nonce, c2, nil)
+    request_sig_d = AEAD_DEC(tls_session_key, tls_session_nonce, c3, nil)
+    
+    actual_request_sig = MAC(iam_credentials, request)
+    _ = ASSERT(actual_request_sig, request_sig_d)?
+
+    enclave_pubkey, pcrs0, pcrs8, nitro_pubkey = SPLIT(attestation_d)
+    //pcrs0, pcrs1, pcrs2, pcrs3, pcrs4 = SPLIT(pcrs)
     _ = ASSERT(pcrs0, pcr0_provisioned)?
-    _ = ASSERT(pcrs1, pcr1_provisioned)?
-    _ = ASSERT(pcrs2, pcr2_provisioned)?
-    _ = ASSERT(pcrs3, pcr3_provisioned)?
-    _ = ASSERT(pcrs4, pcr4_provisioned)?
+    //_ = ASSERT(pcrs1, pcr1_provisioned)?
+    //_ = ASSERT(pcrs2, pcr2_provisioned)?
+    //_ = ASSERT(pcrs3, pcr3_provisioned)?
+    //_ = ASSERT(pcrs4, pcr4_provisioned)?
     _ = ASSERT(pcrs8, pcr8_provisioned)?
-    _ = ASSERT(enclave_pubkey, enclave_public_key)?
-    // data_secret_key = DEC(kms_secret_key, encrypted_data_secret_key)
+    //_ = ASSERT(enclave_pubkey, enclave_public_key)?
+    _ = SIGNVERIF(nitro_pubkey, attestation_d, attestation_sig_d)
+
+    // Since the KMS shouldn't know the data_secret_key, it should execute the step below
+    // But in verifpal, if you declare a named constant, there's no way to forget it or show that it's forgetten so the below step is not necessary
+    plaintext_data_secret_key = DEC(kms_secret_key, encrypted_data_secret_key)
+    _ = ASSERT(plaintext_data_secret_key, data_secret_key)?
     enclave_encrypted_data_secret_key = PKE_ENC(enclave_pubkey, data_secret_key)
 ]
 
-KMS -> Client: enclave_encrypted_data_secret_key
+KMS -> Client: [enclave_encrypted_data_secret_key]
 Client -> Enclave: enclave_encrypted_data_secret_key
 
 principal Enclave[
-    plaintext_data_key = PKE_DEC(enclave_public_key, enclave_encrypted_data_secret_key)
-    dec_data = DEC(plaintext_data_key, encrypted_data)
+    //plaintext_data_key = PKE_DEC(enclave_public_key, enclave_encrypted_data_secret_key)
+    dec_data = DEC(PKE_DEC(enclave_public_key, enclave_encrypted_data_secret_key), encrypted_data)
 ]
 
 queries[
-  confidentiality? data
-  confidentiality? dec_data
-  authentication? Enclave -> KMS: attestation_sig
-  authentication? Enclave -> KMS: attestation
-  equivalence? pcrs0, hash_image
+    confidentiality? data[
+        precondition[KMS -> Client: data_secret_key]
+    ]
+    confidentiality? data[
+	precondition[Client -> Enclave: encrypted_data]
+    ]
+    authentication? Enclave -> KMS: c1
+    authentication? Enclave -> KMS: c2
+    authentication? Enclave -> KMS: c3
+    authentication? Enclave -> KMS: request
+    confidentiality? kms_secret_key
+    confidentiality? data_secret_key
 ]
