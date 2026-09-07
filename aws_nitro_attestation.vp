@@ -18,28 +18,49 @@ principal Provisioner [
 
 Provisioner -> KMS: [pcr0_provisioned], [pcr1_provisioned], [pcr2_provisioned], [pcr3_provisioned], [pcr4_provisioned], [pcr8_provisioned]
 
+principal KMS[
+    knows private kms_secret_key
+    knows private tls_session_key_0
+    knows private tls_session_nonce_0
+    generates data_secret_key
+    encrypted_data_secret_key = ENC(kms_secret_key, data_secret_key)
+    m = CONCAT(data_secret_key, encrypted_data_secret_key)
+    m_ct = AEAD_ENC(tls_session_key_0, tls_session_nonce_0, m, nil)
+    //data_secret_key_ct = AEAD_ENC(tls_session_key_0, tls_session_nonce_0, data_secret_key, nil)
+    //encrypted_data_secret_key_ct = AEAD_ENC(tls_session_key_0, tls_session_nonce_0, encrypted_data_secret_key, nil)
+]
 
-phase[1]
+//KMS -> Client: [data_secret_key_ct], [encrypted_data_secret_key_ct]
+
+KMS -> Client: [m_ct]
+
+principal Client[
+    knows private tls_session_key_0
+    knows private tls_session_nonce_0
+    m_d = AEAD_DEC(tls_session_key_0, tls_session_nonce_0, m_ct, nil)
+    data_secret_key_d, encrypted_data_secret_key_d = SPLIT(m_d)
+    //data_secret_key_d = AEAD_DEC(tls_session_key_0, tls_session_nonce_0, data_secret_key_ct, nil)
+    //encrypted_data_secret_key_d = AEAD_DEC(tls_session_key_0, tls_session_nonce_0, encrypted_data_secret_key_ct, nil)
+]
 
 // The KMS is supposed to "forget" the data_secret_key when it generates it and doesn't store this key itself
 principal KMS[
     knows private iam_credentials
-    generates kms_secret_key
-    generates data_secret_key
-    encrypted_data_secret_key = ENC(kms_secret_key, data_secret_key)
+    //generates kms_secret_key
+    //generates data_secret_key
+//    encrypted_data_secret_key = ENC(kms_secret_key, data_secret_key)
 ]
 
-KMS -> Client: [data_secret_key], [encrypted_data_secret_key]
+//KMS -> Client: [data_secret_key], [encrypted_data_secret_key]
 
 principal Client[
-  knows private data
+  generates data
   knows private iam_credentials
-  encrypted_data = ENC(data_secret_key, data)
+  encrypted_data = ENC(data_secret_key_d, data)
 ]
 
-phase[2]
 
-Client -> Enclave: iam_credentials, encrypted_data_secret_key, encrypted_data
+Client -> Enclave: iam_credentials, encrypted_data_secret_key_d, encrypted_data
 
 principal Enclave[
     // Enclave's runtime keys
@@ -83,6 +104,7 @@ principal NitroHypervisor[
 ]
 
 NitroHypervisor -> Enclave: [attestation], [attestation_sig]
+
 principal Enclave[
     // TLS Session between Enclave and KMS
     knows private tls_session_key
@@ -93,9 +115,10 @@ principal Enclave[
     c1 = AEAD_ENC(tls_session_key, tls_session_nonce, attestation, nil)
     c2 = AEAD_ENC(tls_session_key, tls_session_nonce, attestation_sig, nil)
     c3 = AEAD_ENC(tls_session_key, tls_session_nonce, request_sig, nil)
+    c4 = AEAD_ENC(tls_session_key, tls_session_nonce, encrypted_data_secret_key_d, nil)
 
 ]
-Enclave -> KMS: c1, c2, c3, request
+Enclave -> KMS: c1, c2, c3, c4, request
 
 principal KMS[
     knows private tls_session_key
@@ -104,6 +127,7 @@ principal KMS[
     attestation_d = AEAD_DEC(tls_session_key, tls_session_nonce, c1, nil)
     attestation_sig_d = AEAD_DEC(tls_session_key, tls_session_nonce, c2, nil)
     request_sig_d = AEAD_DEC(tls_session_key, tls_session_nonce, c3, nil)
+    encrypted_data_secret_key_dd = AEAD_DEC(tls_session_key, tls_session_nonce, c4, nil)
     
     actual_request_sig = MAC(iam_credentials, request)
     _ = ASSERT(actual_request_sig, request_sig_d)?
@@ -121,23 +145,20 @@ principal KMS[
 
     // Since the KMS shouldn't know the data_secret_key, it should execute the step below
     // But in verifpal, if you declare a named constant, there's no way to forget it or show that it's forgetten so the below step is not necessary
-    plaintext_data_secret_key = DEC(kms_secret_key, encrypted_data_secret_key)
-    _ = ASSERT(plaintext_data_secret_key, data_secret_key)?
-    enclave_encrypted_data_secret_key = PKE_ENC(enclave_pubkey, data_secret_key)
+    plaintext_data_secret_key = DEC(kms_secret_key, encrypted_data_secret_key_dd)
+    enclave_encrypted_data_secret_key = PKE_ENC(enclave_pubkey, plaintext_data_secret_key)
 ]
 
 KMS -> Client: [enclave_encrypted_data_secret_key]
 Client -> Enclave: enclave_encrypted_data_secret_key
 
 principal Enclave[
-    //plaintext_data_key = PKE_DEC(enclave_public_key, enclave_encrypted_data_secret_key)
-    dec_data = DEC(PKE_DEC(enclave_public_key, enclave_encrypted_data_secret_key), encrypted_data)
+    plaintext_data_key = PKE_DEC(enclave_public_key, enclave_encrypted_data_secret_key)
+    dec_data = DEC(plaintext_data_key, encrypted_data)
 ]
 
 queries[
-    confidentiality? data[
-        precondition[KMS -> Client: data_secret_key]
-    ]
+    confidentiality? data
     confidentiality? data[
 	precondition[Client -> Enclave: encrypted_data]
     ]
@@ -147,4 +168,6 @@ queries[
     authentication? Enclave -> KMS: request
     confidentiality? kms_secret_key
     confidentiality? data_secret_key
+    confidentiality? encrypted_data_secret_key_d
+    confidentiality? encrypted_data
 ]
